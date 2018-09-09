@@ -19,8 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use bytes::Bytes;
-use futures::prelude::*;
-use multiaddr::Multiaddr;
+use futures::{future, prelude::*};
 use std::io::Error as IoError;
 use tokio_io::{AsyncRead, AsyncWrite};
 use upgrade::{ConnectionUpgrade, Endpoint};
@@ -38,11 +37,11 @@ pub fn or<A, B>(me: A, other: B) -> OrUpgrade<A, B> {
 #[derive(Debug, Copy, Clone)]
 pub struct OrUpgrade<A, B>(A, B);
 
-impl<C, A, B, O> ConnectionUpgrade<C> for OrUpgrade<A, B>
+impl<C, A, B, O, Maf> ConnectionUpgrade<C, Maf> for OrUpgrade<A, B>
 where
     C: AsyncRead + AsyncWrite,
-    A: ConnectionUpgrade<C, Output = O>,
-    B: ConnectionUpgrade<C, Output = O>,
+    A: ConnectionUpgrade<C, Maf, Output = O>,
+    B: ConnectionUpgrade<C, Maf, Output = O>,
 {
     type NamesIter = NamesIterChain<A::NamesIter, B::NamesIter>;
     type UpgradeIdentifier = EitherUpgradeIdentifier<A::UpgradeIdentifier, B::UpgradeIdentifier>;
@@ -56,6 +55,7 @@ where
     }
 
     type Output = O;
+    type MultiaddrFuture = future::Either<A::MultiaddrFuture, B::MultiaddrFuture>;
     type Future = EitherConnUpgrFuture<A::Future, B::Future>;
 
     #[inline]
@@ -64,7 +64,7 @@ where
         socket: C,
         id: Self::UpgradeIdentifier,
         ty: Endpoint,
-        remote_addr: &Multiaddr,
+        remote_addr: Maf,
     ) -> Self::Future {
         match id {
             EitherUpgradeIdentifier::First(id) => {
@@ -92,29 +92,30 @@ pub enum EitherUpgradeIdentifier<A, B> {
 //         If Rust had impl Trait we could use the Either enum from the futures crate and add some
 //         modifiers to it. This custom enum is a combination of Either and these modifiers.
 #[derive(Debug, Copy, Clone)]
+#[must_use = "futures do nothing unless polled"]
 pub enum EitherConnUpgrFuture<A, B> {
     First(A),
     Second(B),
 }
 
-impl<A, B, O> Future for EitherConnUpgrFuture<A, B>
+impl<A, B, O, Ma, Mb> Future for EitherConnUpgrFuture<A, B>
 where
-    A: Future<Error = IoError, Item = O>,
-    B: Future<Error = IoError, Item = O>,
+    A: Future<Error = IoError, Item = (O, Ma)>,
+    B: Future<Error = IoError, Item = (O, Mb)>,
 {
-    type Item = O;
+    type Item = (O, future::Either<Ma, Mb>);
     type Error = IoError;
 
     #[inline]
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self {
             &mut EitherConnUpgrFuture::First(ref mut a) => {
-                let item = try_ready!(a.poll());
-                Ok(Async::Ready(item))
+                let (item, fut) = try_ready!(a.poll());
+                Ok(Async::Ready((item, future::Either::A(fut))))
             }
             &mut EitherConnUpgrFuture::Second(ref mut b) => {
-                let item = try_ready!(b.poll());
-                Ok(Async::Ready(item))
+                let (item, fut) = try_ready!(b.poll());
+                Ok(Async::Ready((item, future::Either::B(fut))))
             }
         }
     }

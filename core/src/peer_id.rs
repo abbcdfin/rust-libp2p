@@ -21,56 +21,7 @@
 use bs58;
 use multihash;
 use std::{fmt, str::FromStr};
-
-/// The raw bytes of a public key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicKeyBytes(pub Vec<u8>);
-
-impl PublicKeyBytes {
-    /// Turns this into a `PublicKeyBytesSlice`.
-    #[inline]
-    pub fn as_slice(&self) -> PublicKeyBytesSlice {
-        PublicKeyBytesSlice(&self.0)
-    }
-
-    /// Turns this into a `PeerId`.
-    #[inline]
-    pub fn to_peer_id(&self) -> PeerId {
-        self.as_slice().into()
-    }
-}
-
-/// The raw bytes of a public key.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct PublicKeyBytesSlice<'a>(pub &'a [u8]);
-
-impl<'a> PublicKeyBytesSlice<'a> {
-    /// Turns this into a `PublicKeyBytes`.
-    #[inline]
-    pub fn to_owned(&self) -> PublicKeyBytes {
-        PublicKeyBytes(self.0.to_owned())
-    }
-
-    /// Turns this into a `PeerId`.
-    #[inline]
-    pub fn to_peer_id(&self) -> PeerId {
-        PeerId::from_public_key(*self)
-    }
-}
-
-impl<'a> PartialEq<PublicKeyBytes> for PublicKeyBytesSlice<'a> {
-    #[inline]
-    fn eq(&self, other: &PublicKeyBytes) -> bool {
-        self.0 == &other.0[..]
-    }
-}
-
-impl<'a> PartialEq<PublicKeyBytesSlice<'a>> for PublicKeyBytes {
-    #[inline]
-    fn eq(&self, other: &PublicKeyBytesSlice<'a>) -> bool {
-        self.0 == &other.0[..]
-    }
-}
+use PublicKey;
 
 /// Identifier of a peer of the network.
 ///
@@ -78,7 +29,7 @@ impl<'a> PartialEq<PublicKeyBytesSlice<'a>> for PublicKeyBytes {
 // TODO: maybe keep things in decoded version?
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PeerId {
-    multihash: Vec<u8>,
+    multihash: multihash::Multihash,
 }
 
 impl fmt::Debug for PeerId {
@@ -90,19 +41,37 @@ impl fmt::Debug for PeerId {
 impl PeerId {
     /// Builds a `PeerId` from a public key.
     #[inline]
-    pub fn from_public_key(public_key: PublicKeyBytesSlice) -> PeerId {
-        let data = multihash::encode(multihash::Hash::SHA2256, public_key.0)
+    pub fn from_public_key(public_key: PublicKey) -> PeerId {
+        let protobuf = public_key.into_protobuf_encoding();
+        let multihash = multihash::encode(multihash::Hash::SHA2256, &protobuf)
             .expect("sha2-256 is always supported");
-        PeerId { multihash: data }
+        PeerId { multihash }
     }
 
     /// Checks whether `data` is a valid `PeerId`. If so, returns the `PeerId`. If not, returns
     /// back the data as an error.
     #[inline]
     pub fn from_bytes(data: Vec<u8>) -> Result<PeerId, Vec<u8>> {
-        match multihash::decode(&data) {
-            Ok(_) => Ok(PeerId { multihash: data }),
-            Err(_) => Err(data),
+        match multihash::Multihash::from_bytes(data) {
+            Ok(multihash) => {
+                if multihash.algorithm() == multihash::Hash::SHA2256 {
+                    Ok(PeerId { multihash })
+                } else {
+                    Err(multihash.into_bytes())
+                }
+            },
+            Err(err) => Err(err.data),
+        }
+    }
+
+    /// Turns a `Multihash` into a `PeerId`. If the multihash doesn't use the correct algorithm,
+    /// returns back the data as an error.
+    #[inline]
+    pub fn from_multihash(data: multihash::Multihash) -> Result<PeerId, multihash::Multihash> {
+        if data.algorithm() == multihash::Hash::SHA2256 {
+            Ok(PeerId { multihash: data })
+        } else {
+            Err(data)
         }
     }
 
@@ -111,7 +80,7 @@ impl PeerId {
     /// Note that this is not the same as the public key of the peer.
     #[inline]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.multihash
+        self.multihash.into_bytes()
     }
 
     /// Returns a raw bytes representation of this `PeerId`.
@@ -119,50 +88,45 @@ impl PeerId {
     /// Note that this is not the same as the public key of the peer.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.multihash
+        self.multihash.as_bytes()
     }
 
     /// Returns a base-58 encoded string of this `PeerId`.
     #[inline]
     pub fn to_base58(&self) -> String {
-        bs58::encode(&self.multihash).into_string()
+        bs58::encode(self.multihash.as_bytes()).into_string()
     }
 
     /// Returns the raw bytes of the hash of this `PeerId`.
     #[inline]
-    pub fn hash(&self) -> &[u8] {
-        multihash::decode(&self.multihash)
-            .expect("our inner value should always be valid")
-            .digest
+    pub fn digest(&self) -> &[u8] {
+        self.multihash.digest()
     }
 
     /// Checks whether the public key passed as parameter matches the public key of this `PeerId`.
     ///
     /// Returns `None` if this `PeerId`s hash algorithm is not supported when encoding the
     /// given public key, otherwise `Some` boolean as the result of an equality check.
-    pub fn is_public_key(&self, public_key: PublicKeyBytesSlice) -> Option<bool> {
-        let alg = multihash::decode(&self.multihash)
-            .expect("our inner value should always be valid")
-            .alg;
-        match multihash::encode(alg, public_key.0) {
+    pub fn is_public_key(&self, public_key: &PublicKey) -> Option<bool> {
+        let alg = self.multihash.algorithm();
+        match multihash::encode(alg, &public_key.clone().into_protobuf_encoding()) {
             Ok(compare) => Some(compare == self.multihash),
-            Err(multihash::Error::UnsupportedType) => None,
-            Err(_) => Some(false),
+            Err(multihash::EncodeError::UnsupportedType) => None,
         }
     }
 }
 
-impl From<PublicKeyBytes> for PeerId {
+impl From<PublicKey> for PeerId {
     #[inline]
-    fn from(pubkey: PublicKeyBytes) -> PeerId {
-        PublicKeyBytesSlice(&pubkey.0).into()
+    fn from(key: PublicKey) -> PeerId {
+        PeerId::from_public_key(key)
     }
 }
 
-impl<'a> From<PublicKeyBytesSlice<'a>> for PeerId {
+impl Into<multihash::Multihash> for PeerId {
     #[inline]
-    fn from(pubkey: PublicKeyBytesSlice<'a>) -> PeerId {
-        PeerId::from_public_key(pubkey)
+    fn into(self) -> multihash::Multihash {
+        self.multihash
     }
 }
 
@@ -193,38 +157,25 @@ impl FromStr for PeerId {
 #[cfg(test)]
 mod tests {
     use rand::random;
-    use {PeerId, PublicKeyBytes, PublicKeyBytesSlice};
-
-    #[test]
-    fn pubkey_as_slice_to_owned() {
-        let key = PublicKeyBytes((0 .. 2048).map(|_| -> u8 { random() }).collect());
-        assert_eq!(key.clone().as_slice().to_owned(), key);
-    }
+    use {PeerId, PublicKey};
 
     #[test]
     fn peer_id_is_public_key() {
-        let key = (0 .. 2048).map(|_| -> u8 { random() }).collect::<Vec<u8>>();
-        let peer_id = PeerId::from_public_key(PublicKeyBytesSlice(&key));
-        assert_eq!(peer_id.is_public_key(PublicKeyBytesSlice(&key)), Some(true));
-    }
-
-    #[test]
-    fn pubkey_to_peer_id() {
-        let key = PublicKeyBytes((0 .. 2048).map(|_| -> u8 { random() }).collect());
-        let peer_id = key.to_peer_id();
-        assert_eq!(peer_id.is_public_key(key.as_slice()), Some(true));
+        let key = PublicKey::Rsa((0 .. 2048).map(|_| -> u8 { random() }).collect());
+        let peer_id = PeerId::from_public_key(key.clone());
+        assert_eq!(peer_id.is_public_key(&key), Some(true));
     }
 
     #[test]
     fn peer_id_into_bytes_then_from_bytes() {
-        let peer_id = PublicKeyBytes((0 .. 2048).map(|_| -> u8 { random() }).collect()).to_peer_id();
+        let peer_id = PublicKey::Rsa((0 .. 2048).map(|_| -> u8 { random() }).collect()).into_peer_id();
         let second = PeerId::from_bytes(peer_id.clone().into_bytes()).unwrap();
         assert_eq!(peer_id, second);
     }
 
     #[test]
     fn peer_id_to_base58_then_back() {
-        let peer_id = PublicKeyBytes((0 .. 2048).map(|_| -> u8 { random() }).collect()).to_peer_id();
+        let peer_id = PublicKey::Rsa((0 .. 2048).map(|_| -> u8 { random() }).collect()).into_peer_id();
         let second: PeerId = peer_id.to_base58().parse().unwrap();
         assert_eq!(peer_id, second);
     }

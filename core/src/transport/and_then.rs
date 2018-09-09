@@ -37,16 +37,21 @@ pub struct AndThen<T, C> {
     upgrade: C,
 }
 
-impl<T, C, F, O> Transport for AndThen<T, C>
+impl<T, C, F, O, Maf> Transport for AndThen<T, C>
 where
     T: Transport + 'static,
-    C: FnOnce(T::Output, Endpoint, Multiaddr) -> F + Clone + 'static,
-    F: Future<Item = O, Error = IoError> + 'static,
+    T::Dial: Send,
+    T::Listener: Send,
+    T::ListenerUpgrade: Send,
+    C: FnOnce(T::Output, Endpoint, T::MultiaddrFuture) -> F + Clone + Send + 'static,
+    F: Future<Item = (O, Maf), Error = IoError> + Send + 'static,
+    Maf: Future<Item = Multiaddr, Error = IoError> + 'static,
 {
     type Output = O;
-    type Listener = Box<Stream<Item = Self::ListenerUpgrade, Error = IoError>>;
-    type ListenerUpgrade = Box<Future<Item = (O, Multiaddr), Error = IoError>>;
-    type Dial = Box<Future<Item = (O, Multiaddr), Error = IoError>>;
+    type MultiaddrFuture = Maf;
+    type Listener = Box<Stream<Item = Self::ListenerUpgrade, Error = IoError> + Send>;
+    type ListenerUpgrade = Box<Future<Item = (O, Self::MultiaddrFuture), Error = IoError> + Send>;
+    type Dial = Box<Future<Item = (O, Self::MultiaddrFuture), Error = IoError> + Send>;
 
     #[inline]
     fn listen_on(self, addr: Multiaddr) -> Result<(Self::Listener, Multiaddr), (Self, Multiaddr)> {
@@ -71,7 +76,7 @@ where
         let stream = listening_stream.map(move |connection| {
             let upgrade = upgrade.clone();
             let future = connection.and_then(move |(stream, client_addr)| {
-                upgrade(stream, Endpoint::Listener, client_addr.clone()).map(|o| (o, client_addr))
+                upgrade(stream, Endpoint::Listener, client_addr)
             });
 
             Box::new(future) as Box<_>
@@ -99,8 +104,7 @@ where
         let future = dialed_fut
             // Try to negotiate the protocol.
             .and_then(move |(connection, client_addr)| {
-                upgrade(connection, Endpoint::Dialer, client_addr.clone())
-                    .map(|o| (o, client_addr))
+                upgrade(connection, Endpoint::Dialer, client_addr)
             });
 
         Ok(Box::new(future))
@@ -112,14 +116,20 @@ where
     }
 }
 
-impl<T, C, F, O> MuxedTransport for AndThen<T, C>
+impl<T, C, F, O, Maf> MuxedTransport for AndThen<T, C>
 where
     T: MuxedTransport + 'static,
-    C: FnOnce(T::Output, Endpoint, Multiaddr) -> F + Clone + 'static,
-    F: Future<Item = O, Error = IoError> + 'static,
+    T::Dial: Send,
+    T::Listener: Send,
+    T::ListenerUpgrade: Send,
+    T::Incoming: Send,
+    T::IncomingUpgrade: Send,
+    C: FnOnce(T::Output, Endpoint, T::MultiaddrFuture) -> F + Clone + Send + 'static,
+    F: Future<Item = (O, Maf), Error = IoError> + Send + 'static,
+    Maf: Future<Item = Multiaddr, Error = IoError> + 'static,
 {
-    type Incoming = Box<Future<Item = Self::IncomingUpgrade, Error = IoError>>;
-    type IncomingUpgrade = Box<Future<Item = (O, Multiaddr), Error = IoError>>;
+    type Incoming = Box<Future<Item = Self::IncomingUpgrade, Error = IoError> + Send>;
+    type IncomingUpgrade = Box<Future<Item = (O, Self::MultiaddrFuture), Error = IoError> + Send>;
 
     #[inline]
     fn next_incoming(self) -> Self::Incoming {
@@ -129,11 +139,10 @@ where
             // Try to negotiate the protocol.
             let future = future.and_then(move |(connection, client_addr)| {
                 let upgrade = upgrade.clone();
-                upgrade(connection, Endpoint::Listener, client_addr.clone())
-                    .map(|o| (o, client_addr))
+                upgrade(connection, Endpoint::Listener, client_addr)
             });
 
-            Box::new(future) as Box<Future<Item = _, Error = _>>
+            Box::new(future) as Box<Future<Item = _, Error = _> + Send>
         });
 
         Box::new(future) as Box<_>

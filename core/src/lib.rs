@@ -18,9 +18,6 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-// TODO: use this once stable ; for now we just copy-paste the content of the README.md
-//#![doc(include = "../README.md")]
-
 //! Transport, protocol upgrade and swarm systems of *libp2p*.
 //!
 //! This crate contains all the core traits and mechanisms of the transport and swarm systems
@@ -87,13 +84,11 @@
 //! ```
 //! extern crate libp2p_core;
 //! extern crate libp2p_tcp_transport;
-//! extern crate tokio_core;
 //!
 //! use libp2p_core::Transport;
 //!
 //! # fn main() {
-//! let tokio_core = tokio_core::reactor::Core::new().unwrap();
-//! let tcp_transport = libp2p_tcp_transport::TcpConfig::new(tokio_core.handle());
+//! let tcp_transport = libp2p_tcp_transport::TcpConfig::new();
 //! let upgraded = tcp_transport.with_upgrade(libp2p_core::upgrade::PlainTextConfig);
 //!
 //! // upgraded.dial(...)   // automatically applies the plain text protocol on the socket
@@ -134,27 +129,31 @@
 //! extern crate libp2p_ping;
 //! extern crate libp2p_core;
 //! extern crate libp2p_tcp_transport;
-//! extern crate tokio_core;
+//! extern crate tokio_current_thread;
 //!
 //! use futures::Future;
-//! use libp2p_ping::Ping;
+//! use libp2p_ping::{Ping, PingOutput};
 //! use libp2p_core::Transport;
 //!
 //! # fn main() {
-//! let mut core = tokio_core::reactor::Core::new().unwrap();
-//!
-//! let ping_finished_future = libp2p_tcp_transport::TcpConfig::new(core.handle())
+//! let ping_finished_future = libp2p_tcp_transport::TcpConfig::new()
 //!     // We have a `TcpConfig` struct that implements `Transport`, and apply a `Ping` upgrade on it.
 //!     .with_upgrade(Ping)
 //!     // TODO: right now the only available protocol is ping, but we want to replace it with
 //!     //       something that is more simple to use
 //!     .dial("127.0.0.1:12345".parse::<libp2p_core::Multiaddr>().unwrap()).unwrap_or_else(|_| panic!())
-//!     .and_then(|((mut pinger, service), _)| {
-//!         pinger.ping().map_err(|_| panic!()).select(service).map_err(|_| panic!())
+//!     .and_then(|(out, _)| {
+//!         match out {
+//!             PingOutput::Ponger(processing) => Box::new(processing) as Box<Future<Item = _, Error = _>>,
+//!             PingOutput::Pinger { mut pinger, processing } => {
+//!                 let f = pinger.ping().map_err(|_| panic!()).select(processing).map(|_| ()).map_err(|(err, _)| err);
+//!                 Box::new(f) as Box<Future<Item = _, Error = _>>
+//!             },
+//!         }
 //!     });
 //!
 //! // Runs until the ping arrives.
-//! core.run(ping_finished_future).unwrap();
+//! tokio_current_thread::block_on_all(ping_finished_future).unwrap();
 //! # }
 //! ```
 //!
@@ -176,30 +175,32 @@
 //! extern crate libp2p_ping;
 //! extern crate libp2p_core;
 //! extern crate libp2p_tcp_transport;
-//! extern crate tokio_core;
+//! extern crate tokio_current_thread;
 //!
-//! use futures::Future;
-//! use libp2p_ping::Ping;
+//! use futures::{Future, Stream};
+//! use libp2p_ping::{Ping, PingOutput};
 //! use libp2p_core::Transport;
 //!
 //! # fn main() {
-//! let mut core = tokio_core::reactor::Core::new().unwrap();
-//!
-//! let transport = libp2p_tcp_transport::TcpConfig::new(core.handle())
+//! let transport = libp2p_tcp_transport::TcpConfig::new()
 //!     .with_dummy_muxing();
 //!
 //! let (swarm_controller, swarm_future) = libp2p_core::swarm(transport.with_upgrade(Ping),
-//!     |(mut pinger, service), client_addr| {
-//!         pinger.ping().map_err(|_| panic!())
-//!             .select(service).map_err(|_| panic!())
-//!             .map(|_| ())
+//!     |out, client_addr| {
+//!         match out {
+//!             PingOutput::Ponger(processing) => Box::new(processing) as Box<Future<Item = _, Error = _>>,
+//!             PingOutput::Pinger { mut pinger, processing } => {
+//!                 let f = pinger.ping().map_err(|_| panic!()).select(processing).map(|_| ()).map_err(|(err, _)| err);
+//!                 Box::new(f) as Box<Future<Item = _, Error = _>>
+//!             },
+//!         }
 //!     });
 //!
 //! // The `swarm_controller` can then be used to do some operations.
 //! swarm_controller.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap());
 //!
 //! // Runs until everything is finished.
-//! core.run(swarm_future).unwrap();
+//! tokio_current_thread::block_on_all(swarm_future.for_each(|_| Ok(()))).unwrap();
 //! # }
 //! ```
 
@@ -213,19 +214,32 @@ extern crate log;
 extern crate multihash;
 extern crate multistream_select;
 extern crate parking_lot;
+extern crate protobuf;
 #[macro_use]
 extern crate quick_error;
+extern crate rw_stream_sink;
 extern crate smallvec;
 extern crate tokio_io;
 
 #[cfg(test)]
 extern crate rand;
+#[cfg(test)]
+extern crate tokio;
+#[cfg(test)]
+extern crate tokio_codec;
+#[cfg(test)]
+extern crate tokio_current_thread;
+#[cfg(test)]
+extern crate tokio_timer;
 
 /// Multi-address re-export.
 pub extern crate multiaddr;
 
 mod connection_reuse;
+mod keys_proto;
 mod peer_id;
+mod public_key;
+mod unique;
 
 pub mod either;
 pub mod muxing;
@@ -236,7 +250,9 @@ pub mod upgrade;
 pub use self::connection_reuse::ConnectionReuse;
 pub use self::multiaddr::{AddrComponent, Multiaddr};
 pub use self::muxing::StreamMuxer;
-pub use self::peer_id::{PeerId, PublicKeyBytes, PublicKeyBytesSlice};
-pub use self::swarm::{swarm, SwarmController, SwarmFuture};
+pub use self::peer_id::PeerId;
+pub use self::public_key::PublicKey;
+pub use self::swarm::{swarm, SwarmController, SwarmEvents};
 pub use self::transport::{MuxedTransport, Transport};
+pub use self::unique::{UniqueConnec, UniqueConnecFuture, UniqueConnecState};
 pub use self::upgrade::{ConnectionUpgrade, Endpoint};
